@@ -110,6 +110,52 @@ class ReconcileResponse(BaseModel):
     unmatched_right_ids: list[str]
 
 
+DiagnosticReason = Literal[
+    "no_counterparty",
+    "sign_mismatch",
+    "amount_mismatch",
+    "time_window",
+    "excluded_pair",
+    "optimization_conflict",
+]
+
+
+class DiagnosticEntry(BaseModel):
+    """Why one transaction left unmatched by the optimum could not be grouped.
+
+    - ``side``: ``"left"`` or ``"right"``;
+    - ``transaction_id``: the unmatched transaction's id;
+    - ``reason``: the first filter that removes every enumerated 1-1 / 1-2 /
+      1-3 / 2-1 / 3-1 combination containing the transaction --
+      ``no_counterparty`` (no non-locked counterparty exists), ``sign_mismatch``
+      (every combination mixes amount signs), ``amount_mismatch`` (side sums
+      never match), ``time_window`` (every equal-sum combination spans more
+      than 48 hours), ``excluded_pair`` (every surviving combination contains
+      an excluded pair) -- or ``optimization_conflict`` when fully legal
+      groups exist for the transaction but none is selected by the
+      maximum-total (lexicographically tie-broken) solution.
+    """
+
+    side: Literal["left", "right"]
+    transaction_id: str
+    reason: DiagnosticReason
+
+
+class DiagnosticsResponse(BaseModel):
+    """The standard reconciliation result plus per-unmatched-transaction
+    diagnostics.
+
+    ``diagnostics`` contains exactly the unmatched transactions, ordered left
+    side first then right side, each side in request input order.
+    """
+
+    groups: list[GroupOut]
+    total_amount: int
+    unmatched_left_ids: list[str]
+    unmatched_right_ids: list[str]
+    diagnostics: list[DiagnosticEntry]
+
+
 SuboptimalReason = Literal["amount", "lexicographic"]
 
 

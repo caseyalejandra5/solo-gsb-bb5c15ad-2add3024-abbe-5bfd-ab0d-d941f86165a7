@@ -17,6 +17,8 @@ from .models import (
     AuditRequest,
     AuditResponse,
     DaySummary,
+    DiagnosticsResponse,
+    DiagnosticEntry,
     GroupOut,
     ReconcileRequest,
     ReconcileResponse,
@@ -122,24 +124,40 @@ def prepare_batch(payload: ReconcileRequest) -> tuple[Reconciler, list]:
     return reconciler, locked_cands
 
 
-def solve(payload: ReconcileRequest) -> ReconcileResponse:
-    """Validate the batch and compute the reconciliation result."""
+def _solve_groups(payload: ReconcileRequest) -> tuple[Reconciler, list]:
+    """Validate the batch and return ``(reconciler, sorted optimal groups)``."""
     reconciler, _ = prepare_batch(payload)
-
     groups = reconciler.solve()
     groups.sort(key=lambda c: c.encoding)
+    return reconciler, groups
 
+
+def _result_fields(
+    payload: ReconcileRequest, groups: list
+) -> tuple[list[GroupOut], int, list[str], list[str]]:
+    """Build the standard response fields from a solved group list."""
     matched_left = {i for c in groups for i in c.left_ids}
     matched_right = {i for c in groups for i in c.right_ids}
-
-    return ReconcileResponse(
-        groups=[
+    return (
+        [
             GroupOut(left_ids=list(c.left_ids), right_ids=list(c.right_ids), amount=c.amount)
             for c in groups
         ],
-        total_amount=sum(c.weight for c in groups),
-        unmatched_left_ids=sorted(t.id for t in payload.left if t.id not in matched_left),
-        unmatched_right_ids=sorted(t.id for t in payload.right if t.id not in matched_right),
+        sum(c.weight for c in groups),
+        sorted(t.id for t in payload.left if t.id not in matched_left),
+        sorted(t.id for t in payload.right if t.id not in matched_right),
+    )
+
+
+def solve(payload: ReconcileRequest) -> ReconcileResponse:
+    """Validate the batch and compute the reconciliation result."""
+    _, groups = _solve_groups(payload)
+    out_groups, total, unmatched_left, unmatched_right = _result_fields(payload, groups)
+    return ReconcileResponse(
+        groups=out_groups,
+        total_amount=total,
+        unmatched_left_ids=unmatched_left,
+        unmatched_right_ids=unmatched_right,
     )
 
 
@@ -196,6 +214,42 @@ def reconcile(
         raise HTTPException(status_code=409, detail=str(exc))
 
     return _stored_response(result.body, result.replayed)
+
+
+@app.post("/reconcile/diagnostics", response_model=DiagnosticsResponse)
+def diagnostics(payload: ReconcileRequest) -> DiagnosticsResponse:
+    """Explain why each transaction left unmatched by the optimum is unmatched.
+
+    Runs the exact same validation and optimal reconciliation as
+    ``POST /reconcile`` (same 400/422 behaviour), then for every unmatched
+    transaction enumerates all 1-1 / 1-2 / 1-3 / 2-1 / 3-1 combinations that
+    contain it without using any locked transaction (transactions matched by
+    the optimum are allowed as counterparties), and applies the counterparty,
+    sign, equal-amount, 48-hour and excluded-pair filters in order.  The first
+    filter that empties the set is reported as ``no_counterparty``,
+    ``sign_mismatch``, ``amount_mismatch``, ``time_window`` or
+    ``excluded_pair``; a transaction with fully legal candidates that is still
+    unmatched gets ``optimization_conflict``.
+
+    The response carries the standard ``groups`` / ``total_amount`` /
+    ``unmatched_*`` fields plus a ``diagnostics`` list covering exactly the
+    unmatched transactions, ordered left side first then right side, each side
+    in request input order.  This endpoint does not participate in
+    ``Idempotency-Key`` replay.
+    """
+    reconciler, groups = _solve_groups(payload)
+    out_groups, total, unmatched_left, unmatched_right = _result_fields(payload, groups)
+    diag_rows = reconciler.diagnose(groups)
+    return DiagnosticsResponse(
+        groups=out_groups,
+        total_amount=total,
+        unmatched_left_ids=unmatched_left,
+        unmatched_right_ids=unmatched_right,
+        diagnostics=[
+            DiagnosticEntry(side=side, transaction_id=tid, reason=reason)
+            for side, tid, reason in diag_rows
+        ],
+    )
 
 
 @app.post("/reconcile/unmatched-summary", response_model=UnmatchedSummaryResponse)

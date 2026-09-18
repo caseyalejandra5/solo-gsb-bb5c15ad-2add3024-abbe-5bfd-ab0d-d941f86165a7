@@ -356,6 +356,61 @@ curl -X POST http://localhost:8000/reconcile \
 
 该接口不参与 `Idempotency-Key` 幂等重放。
 
+### `POST /reconcile/diagnostics`
+
+诊断每笔**未匹配流水**为什么没能成组。请求体与 `POST /reconcile` **完全相同**
+（复用 `left` / `right` / `locked_groups` / `excluded_pairs`，校验规则、400/422
+行为与求解结果完全一致）；服务端先执行同一套最优核销，再为每笔未匹配流水逐项给出
+未匹配原因。
+
+**诊断过程。** 对每笔未匹配流水，枚举包含该流水、且**不占用任何锁定流水**的全部
+五种组形组合（1-1 / 1-2 / 1-3 / 2-1 / 3-1）——已被最优解匹配的流水仍可作为候选
+对侧出现，锁定流水一律不参与枚举；然后按固定顺序依次施加过滤，**第一次把剩余组合
+全部清空**的过滤器即为该流水的原因：
+
+1. `no_counterparty`：不存在可枚举的组合（对侧已无非锁定流水，或本方/对侧非锁定
+   流水数量不足以组成任何组形）；
+2. `sign_mismatch`：剩余组合全部金额异号（组内不能同号）；
+3. `amount_mismatch`：剩余组合的两侧金额之和都不相等；
+4. `time_window`：金额相等的组合时间跨度均超过 48 小时；
+5. `excluded_pair`：仅剩的组合都包含某个排除对。
+
+通过全部过滤后仍有完全合法的候选组、但该流水仍未进入最优解时，返回
+`optimization_conflict`：候选组合法却未被“核销总额最大（并列时字典序最小）”的
+规范最优解选中（例如它需要的流水被金额更大的组占用，或字典序并列时落选）。
+
+**响应示例**（最优解为 `(A+B,X)=150`，`Y=100` 有合法候选 `(A,Y)` 却落选）：
+
+```json
+{
+  "groups": [
+    { "left_ids": ["A", "B"], "right_ids": ["X"], "amount": 150 }
+  ],
+  "total_amount": 150,
+  "unmatched_left_ids": [],
+  "unmatched_right_ids": ["Y"],
+  "diagnostics": [
+    { "side": "right", "transaction_id": "Y", "reason": "optimization_conflict" }
+  ]
+}
+```
+
+- `groups` / `total_amount` / `unmatched_left_ids` / `unmatched_right_ids`：
+  与 `POST /reconcile` 完全一致（`groups` 按组编码升序，未匹配 ID 列表升序）；
+- `diagnostics`：**仅包含未匹配流水**，每项形如
+  `{"side": "left" | "right", "transaction_id": "...", "reason": "..."}`；
+  顺序为先全部 left 再全部 right，每侧内部按**请求中的输入顺序**排列（不做排序）；
+- 没有未匹配流水时 `diagnostics` 为空数组。
+
+其余原因示例：对侧为空（或唯一对侧流水被锁定）时为 `no_counterparty`；
+`L1=100` 对 `R1=-100` 时两侧均报 `sign_mismatch`；`L1=100` 对 `R1=101` 时报
+`amount_mismatch`；唯一等额组合相隔超过 48 小时报 `time_window`；含该流水的合法
+组合全部命中 `excluded_pairs` 时报 `excluded_pair`。过滤器严格按上述顺序生效：
+例如同时异号且金额不等时报告 `sign_mismatch`，同时超时且命中排除对时报告
+`time_window`。
+
+该接口不参与 `Idempotency-Key` 幂等重放。
+
 ## 算法
 
 1. 枚举全部合法候选组（每侧 ≤12 笔，候选上限约 7000 个）；
@@ -382,16 +437,17 @@ pytest
 
 包含 API 行为测试与求解器对暴力枚举的随机差分测试（含带 `locked_groups`、
 `excluded_pairs` 以及二者组合的场景），以及 `/reconcile/audit` 的逐组错误、
-金额次优与字典序次优场景测试。
+金额次优与字典序次优场景测试；`/reconcile/diagnostics` 覆盖六种未匹配原因、
+过滤器优先级、left/right 输入顺序排列，以及与 `/reconcile` 的结果一致性。
 
 ## 项目结构
 
 ```
 app/
-  main.py         # FastAPI 入口与 /reconcile、/reconcile/audit、
-                  # /reconcile/unmatched-summary 端点
+  main.py         # FastAPI 入口与 /reconcile、/reconcile/diagnostics、
+                  # /reconcile/audit、/reconcile/unmatched-summary 端点
   models.py       # 请求/响应模型与校验
-  solver.py       # 候选生成 + 最优互斥集求解
+  solver.py       # 候选生成 + 最优互斥集求解 + 未匹配原因诊断
   idempotency.py  # Idempotency-Key 指纹与 SQLite 持久化
 tests/            # pytest 测试
 Dockerfile

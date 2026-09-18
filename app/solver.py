@@ -590,3 +590,144 @@ class Reconciler:
             else:  # pragma: no cover - defensive, cannot happen if _max_value is exact
                 raise RuntimeError("no feasible candidate for the remaining optimum")
         return sorted(self.locked + solution, key=lambda c: c.encoding)
+
+    # ------------------------------------------------------------------ #
+    # per-unmatched-transaction diagnostics
+    # ------------------------------------------------------------------ #
+    def diagnose(
+        self, solution: Sequence[Candidate]
+    ) -> list[tuple[str, str, str]]:
+        """Explain why every transaction left out of ``solution`` stays unmatched.
+
+        For each unmatched transaction the five legal shapes (1-1, 1-2, 1-3,
+        2-1, 3-1) are enumerated using every non-locked transaction on both
+        sides -- transactions matched by ``solution`` are allowed to act as
+        counterparties, since the question is why *this* transaction could not
+        join any group at all; locked transactions never participate.  The
+        resulting combinations then pass the same filters candidate generation
+        uses, in order, and the first filter that removes every remaining
+        combination is reported:
+
+          * ``no_counterparty`` -- no shape can be built (the opposite side has
+            no usable transaction);
+          * ``sign_mismatch``    -- every remaining combination mixes signs;
+          * ``amount_mismatch``  -- the two side sums are never equal;
+          * ``time_window``      -- every equal-sum combination spans more than
+            48 hours;
+          * ``excluded_pair``    -- the only survivors contain an excluded pair.
+
+        When at least one combination survives all filters but the
+        transaction is still unmatched by the canonical optimum, the reason is
+        ``optimization_conflict``: fully legal groups exist for it, but none is
+        selected by the maximum-total (lexicographically tie-broken) solution.
+
+        Returns ``(side, id, reason)`` rows ordered left side then right side,
+        each in the side's input order.
+        """
+        locked_mask = 0
+        for cand in self.locked:
+            locked_mask |= cand.mask
+        matched_mask = 0
+        for cand in solution:
+            matched_mask |= cand.mask
+
+        # Non-locked transactions per side, in input order.
+        free_left = [i for i in range(self.n_left) if not (locked_mask >> i) & 1]
+        free_right = [
+            j
+            for j in range(len(self.right))
+            if not (locked_mask >> (self.n_left + j)) & 1
+        ]
+
+        rows: list[tuple[str, str, str]] = []
+        for side, idxs in (("left", free_left), ("right", free_right)):
+            for i in idxs:
+                if (matched_mask >> (i if side == "left" else self.n_left + i)) & 1:
+                    continue
+                reason = self._diagnose_txn(side, i, free_left, free_right)
+                tid = self.left[i].id if side == "left" else self.right[i].id
+                rows.append((side, tid, reason))
+        return rows
+
+    def _diagnose_txn(
+        self,
+        side: str,
+        idx: int,
+        free_left: list[int],
+        free_right: list[int],
+    ) -> str:
+        """Apply the ordered filters to every shape containing transaction
+        ``idx`` and return the first filter that empties the candidate set."""
+        # Combinations are stored globally as (left indices, right indices);
+        # ``idx`` belongs to ``side`` and must always be a member of its side.
+        combos: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+        for lc, rc in GROUP_SHAPES:
+            if side == "left":
+                own_count, other_count, own_pool, other_pool = (
+                    lc,
+                    rc,
+                    free_left,
+                    free_right,
+                )
+            else:
+                own_count, other_count, own_pool, other_pool = (
+                    rc,
+                    lc,
+                    free_right,
+                    free_left,
+                )
+            if other_count > len(other_pool):
+                continue
+            own_rest = [k for k in own_pool if k != idx]
+            if own_count - 1 > len(own_rest):
+                continue
+            for extra in combinations(own_rest, own_count - 1):
+                own = (idx,) + extra
+                for other in combinations(other_pool, other_count):
+                    combos.append((own, other) if side == "left" else (other, own))
+
+        if not combos:
+            return "no_counterparty"
+
+        # sign filter
+        signed = []
+        for lcomb, rcomb in combos:
+            amounts = [self.left[i].amount for i in lcomb]
+            amounts += [self.right[j].amount for j in rcomb]
+            if all(a > 0 for a in amounts) or all(a < 0 for a in amounts):
+                signed.append((lcomb, rcomb))
+        if not signed:
+            return "sign_mismatch"
+
+        # equal-sum filter
+        equal = [
+            (lcomb, rcomb)
+            for lcomb, rcomb in signed
+            if sum(self.left[i].amount for i in lcomb)
+            == sum(self.right[j].amount for j in rcomb)
+        ]
+        if not equal:
+            return "amount_mismatch"
+
+        # 48-hour window filter
+        timely = []
+        for lcomb, rcomb in equal:
+            times = [self.left[i].ts for i in lcomb]
+            times += [self.right[j].ts for j in rcomb]
+            if max(times) - min(times) <= MAX_SPAN_SECONDS:
+                timely.append((lcomb, rcomb))
+        if not timely:
+            return "time_window"
+
+        # excluded-pair filter
+        allowed = [
+            (lcomb, rcomb)
+            for lcomb, rcomb in timely
+            if not self._contains_excluded_pair(lcomb, rcomb)
+        ]
+        if not allowed:
+            return "excluded_pair"
+
+        # Every survivor is a fully legal candidate; the transaction is still
+        # unmatched because none of them is selected by the canonical optimum.
+        return "optimization_conflict"
