@@ -110,6 +110,36 @@ class ReconcileResponse(BaseModel):
     unmatched_right_ids: list[str]
 
 
+DiagnosticReason = Literal[
+    "no_counterparty",
+    "sign_mismatch",
+    "amount_mismatch",
+    "time_window",
+    "excluded_pair",
+    "optimization_conflict",
+]
+
+
+class UnmatchedDiagnosticOut(BaseModel):
+    """Diagnosis for one unmatched transaction.
+
+    ``candidates`` lists the opposite-side ids sharing at least one fully
+    legal group with this transaction; it is only populated for
+    ``optimization_conflict``.
+    """
+
+    id: str
+    side: Literal["left", "right"]
+    reason: DiagnosticReason
+    candidates: list[str]
+
+
+class DiagnosticsResponse(ReconcileResponse):
+    """The standard reconciliation result plus per-unmatched diagnostics."""
+
+    diagnostics: list[UnmatchedDiagnosticOut]
+
+
 SuboptimalReason = Literal["amount", "lexicographic"]
 
 

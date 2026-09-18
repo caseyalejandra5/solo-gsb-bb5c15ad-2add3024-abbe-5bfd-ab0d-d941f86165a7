@@ -356,6 +356,63 @@ curl -X POST http://localhost:8000/reconcile \
 
 该接口不参与 `Idempotency-Key` 幂等重放。
 
+### `POST /reconcile/diagnostics`
+
+诊断**最优解中每笔未匹配流水**的原因。请求体与 `POST /reconcile` 完全相同
+（`left` / `right` / `locked_groups` / `excluded_pairs`，校验规则与 400/422 行为
+完全一致），服务端先执行相同的最优核销求解，再对每笔未匹配流水给出诊断：
+
+```json
+{
+  "left":  [
+    { "id": "A", "time": "2026-09-17T00:00:00Z", "amount": 100 },
+    { "id": "B", "time": "2026-09-17T00:00:00Z", "amount": 100 }
+  ],
+  "right": [
+    { "id": "X", "time": "2026-09-17T00:00:00Z", "amount": 100 }
+  ]
+}
+```
+
+**诊断规则。** 对每笔未匹配流水，枚举所有包含它、且不占用锁定组流水的
+1-1 / 1-2 / 1-3 / 2-1 / 3-1 组合（已匹配但未锁定的流水仍可参与组合），
+然后按固定顺序依次施加过滤，**首个使候选组合清空的过滤条件即为原因**：
+
+| `reason`                 | 含义                                                     |
+| ------------------------ | -------------------------------------------------------- |
+| `no_counterparty`        | 对侧没有可用流水（对侧为空，或全部对侧流水被锁定组占用） |
+| `sign_mismatch`          | 没有任何同号组合（对侧可用流水符号全部相反）             |
+| `amount_mismatch`        | 有同号组合，但没有任何两侧金额之和相等的组合             |
+| `time_window`            | 有等额组合，但全部超出 48 小时时间窗                     |
+| `excluded_pair`          | 有合法组合，但全部命中排除对                             |
+| `optimization_conflict`  | 存在完全合法的候选组合，但最优解未选用其中任何一个       |
+
+**响应示例**（最优解为 `(A,X)`，`B` 与 `X` 本可合法成组但未被选中）：
+
+```json
+{
+  "groups": [
+    { "left_ids": ["A"], "right_ids": ["X"], "amount": 100 }
+  ],
+  "total_amount": 100,
+  "unmatched_left_ids": ["B"],
+  "unmatched_right_ids": [],
+  "diagnostics": [
+    { "id": "B", "side": "left", "reason": "optimization_conflict", "candidates": ["X"] }
+  ]
+}
+```
+
+- `groups` / `total_amount` / `unmatched_left_ids` / `unmatched_right_ids`：与
+  `POST /reconcile` 的响应完全相同；
+- `diagnostics`：仅包含未匹配流水的诊断，按**左侧在前、同侧按输入顺序**排列；
+  - `side`：`"left"` / `"right"`；
+  - `candidates`：仅当 `reason` 为 `optimization_conflict` 时非空——与该流水共同出现在
+    至少一个合法候选组合中的**对侧流水 ID**（去重，按对侧输入顺序排列），其余原因下为空数组；
+- 没有未匹配流水时 `diagnostics` 为空数组。
+
+该接口不参与 `Idempotency-Key` 幂等重放。
+
 ## 算法
 
 1. 枚举全部合法候选组（每侧 ≤12 笔，候选上限约 7000 个）；
@@ -382,16 +439,17 @@ pytest
 
 包含 API 行为测试与求解器对暴力枚举的随机差分测试（含带 `locked_groups`、
 `excluded_pairs` 以及二者组合的场景），以及 `/reconcile/audit` 的逐组错误、
-金额次优与字典序次优场景测试。
+金额次优与字典序次优场景测试、`/reconcile/diagnostics` 的六种诊断原因与
+候选列表（对照候选池的随机校验）测试。
 
 ## 项目结构
 
 ```
 app/
   main.py         # FastAPI 入口与 /reconcile、/reconcile/audit、
-                  # /reconcile/unmatched-summary 端点
+                  # /reconcile/unmatched-summary、/reconcile/diagnostics 端点
   models.py       # 请求/响应模型与校验
-  solver.py       # 候选生成 + 最优互斥集求解
+  solver.py       # 候选生成 + 最优互斥集求解 + 未匹配诊断
   idempotency.py  # Idempotency-Key 指纹与 SQLite 持久化
 tests/            # pytest 测试
 Dockerfile

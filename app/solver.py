@@ -17,6 +17,12 @@ declares must never share a reconciliation group.  Any candidate containing
 both members of an excluded pair is dropped before optimisation, and a locked
 group containing one is rejected outright.
 
+``diagnose_unmatched`` complements the optimum with per-transaction
+diagnostics: for every unmatched flow it replays the legality filters in a
+fixed order over every combination that could have contained it and reports
+the first filter that leaves nothing, or an optimisation conflict when legal
+candidates existed but the optimum selected none of them.
+
 Group legality rules:
   * shapes: 1-1, or a single record on one side with 2-3 on the other;
   * every amount in the group shares the same sign;
@@ -28,7 +34,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import combinations
-from typing import Sequence
+from typing import Literal, Sequence
 
 MAX_SPAN_SECONDS = 48 * 3600  # 48 hours, inclusive
 # (left count, right count) shapes: 1-1 plus one-to-many (2..3) in both directions.
@@ -71,6 +77,34 @@ class ExcludedPair:
 
     left_id: str
     right_id: str
+
+
+# Reasons why an unmatched transaction stayed out of the optimal solution,
+# reported by ``diagnose_unmatched``.
+DiagnosticReason = Literal[
+    "no_counterparty",
+    "sign_mismatch",
+    "amount_mismatch",
+    "time_window",
+    "excluded_pair",
+    "optimization_conflict",
+]
+
+
+@dataclass(frozen=True)
+class UnmatchedDiagnostic:
+    """Diagnosis for one transaction the optimal solution left unmatched.
+
+    ``candidates`` lists the transaction ids of the opposite side that appear
+    in at least one fully legal group with the diagnosed transaction (empty
+    unless the reason is ``optimization_conflict``); they are deduplicated and
+    ordered by the opposite side's input order.
+    """
+
+    id: str
+    side: Literal["left", "right"]
+    reason: DiagnosticReason
+    candidates: tuple[str, ...]
 
 
 class LockedGroupError(ValueError):
@@ -366,6 +400,130 @@ def resolve_proposed_groups(
             claimed.update(valid_rids)
 
     return resolved, errors
+
+
+def diagnose_unmatched(
+    rec: "Reconciler",
+    solution: Sequence[Candidate],
+) -> list[UnmatchedDiagnostic]:
+    """Explain why each unmatched transaction stayed out of ``solution``.
+
+    ``solution`` must be the reconciler's optimal packing (locked groups
+    included).  For every transaction the solution leaves unmatched, all
+    1-1 / 1-2 / 1-3 / 2-1 / 3-1 combinations are enumerated that contain the
+    transaction and no locked-group transaction, and the legality filters are
+    applied in a fixed order:
+
+      1. opposite side present (``no_counterparty``);
+      2. common sign (``sign_mismatch``);
+      3. equal side sums (``amount_mismatch``);
+      4. 48-hour span (``time_window``);
+      5. operator-declared excluded pairs (``excluded_pair``).
+
+    The reason is the first filter that empties the candidate list; when fully
+    legal candidates exist but the optimum picked none of them, the reason is
+    ``optimization_conflict``.  The result is ordered left side first, each
+    side in input order.
+    """
+    locked_mask = 0
+    for cand in rec.locked:
+        locked_mask |= cand.mask
+    matched_mask = locked_mask
+    for cand in solution:
+        matched_mask |= cand.mask
+
+    # (same-side companions, opposite-side members) choices reproducing the
+    # five legal group shapes for a group built around one transaction
+    SHAPE_CHOICES = ((0, 1), (0, 2), (0, 3), (1, 1), (2, 1))
+
+    n_left, amounts, txns = rec.n_left, rec.amounts, rec.txns
+    diagnostics: list[UnmatchedDiagnostic] = []
+    for t, txn in enumerate(txns):
+        if matched_mask & (1 << t):
+            continue
+        if t < n_left:
+            side: Literal["left", "right"] = "left"
+            same = [
+                i for i in range(n_left) if i != t and not locked_mask & (1 << i)
+            ]
+            opp = [
+                n_left + j
+                for j in range(len(rec.right))
+                if not locked_mask & (1 << (n_left + j))
+            ]
+        else:
+            side = "right"
+            same = [
+                n_left + j
+                for j in range(len(rec.right))
+                if n_left + j != t and not locked_mask & (1 << (n_left + j))
+            ]
+            opp = [i for i in range(n_left) if not locked_mask & (1 << i)]
+        if not opp:
+            diagnostics.append(UnmatchedDiagnostic(txn.id, side, "no_counterparty", ()))
+            continue
+
+        # Same-sign combinations only: with every amount non-zero a group
+        # summing to the same value on both sides can never mix signs, so the
+        # amount filter would discard mixed-sign combinations anyway.
+        sign_same = [i for i in same if amounts[i] * amounts[t] > 0]
+        sign_opp = [i for i in opp if amounts[i] * amounts[t] > 0]
+        combos = [
+            (t,) + companions + partners
+            for n_same, n_opp in SHAPE_CHOICES
+            for companions in combinations(sign_same, n_same)
+            for partners in combinations(sign_opp, n_opp)
+        ]
+        if not combos:
+            diagnostics.append(UnmatchedDiagnostic(txn.id, side, "sign_mismatch", ()))
+            continue
+
+        combos = [
+            combo
+            for combo in combos
+            if sum(amounts[i] for i in combo if i < n_left)
+            == sum(amounts[i] for i in combo if i >= n_left)
+        ]
+        if not combos:
+            diagnostics.append(UnmatchedDiagnostic(txn.id, side, "amount_mismatch", ()))
+            continue
+
+        combos = [
+            combo
+            for combo in combos
+            if max(txns[i].ts for i in combo) - min(txns[i].ts for i in combo)
+            <= MAX_SPAN_SECONDS
+        ]
+        if not combos:
+            diagnostics.append(UnmatchedDiagnostic(txn.id, side, "time_window", ()))
+            continue
+
+        combos = [
+            combo
+            for combo in combos
+            if not any(
+                li in combo and ri in combo for li, ri in rec.excluded_index_pairs
+            )
+        ]
+        if not combos:
+            diagnostics.append(UnmatchedDiagnostic(txn.id, side, "excluded_pair", ()))
+            continue
+
+        t_on_left = t < n_left
+        counterparties = tuple(
+            dict.fromkeys(
+                i for combo in combos for i in combo if (i < n_left) != t_on_left
+            )
+        )
+        diagnostics.append(
+            UnmatchedDiagnostic(
+                txn.id,
+                side,
+                "optimization_conflict",
+                tuple(txns[i].id for i in counterparties),
+            )
+        )
+    return diagnostics
 
 
 class Reconciler:
