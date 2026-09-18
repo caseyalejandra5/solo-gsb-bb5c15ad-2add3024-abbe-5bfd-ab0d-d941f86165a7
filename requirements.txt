@@ -1,0 +1,5 @@
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.29
+pydantic>=2.6
+# IANA database for zoneinfo: python:*-slim images ship no system tzdata.
+tzdata>=2024.1
